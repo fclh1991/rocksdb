@@ -832,6 +832,10 @@ struct DBOptions {
   // Default: false
   bool create_if_missing;
 
+  // dump WAL asyncly by background thread
+  // Default: false
+  bool async_wal;
+
   // If true, missing column families will be automatically created.
   // Default: false
   bool create_missing_column_families;

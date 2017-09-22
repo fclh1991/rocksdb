@@ -159,6 +159,7 @@ ColumnFamilyOptions::ColumnFamilyOptions(const Options& options)
 
 DBOptions::DBOptions()
     : create_if_missing(false),
+      async_wal(false),
       create_missing_column_families(false),
       error_if_exists(false),
       paranoid_checks(true),
@@ -230,6 +231,7 @@ DBOptions::DBOptions()
 
 DBOptions::DBOptions(const Options& options)
     : create_if_missing(options.create_if_missing),
+      async_wal(options.async_wal),
       create_missing_column_families(options.create_missing_column_families),
       error_if_exists(options.error_if_exists),
       paranoid_checks(options.paranoid_checks),
@@ -307,6 +309,7 @@ static const char* const access_hints[] = {
 void DBOptions::Dump(Logger* log) const {
     Header(log, "         Options.error_if_exists: %d", error_if_exists);
     Header(log, "       Options.create_if_missing: %d", create_if_missing);
+    Header(log, "       Options.async_wal: %d",         async_wal);
     Header(log, "         Options.paranoid_checks: %d", paranoid_checks);
     Header(log, "                     Options.env: %p", env);
     Header(log, "                Options.info_log: %p", info_log.get());
