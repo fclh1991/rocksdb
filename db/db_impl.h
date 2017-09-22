@@ -60,6 +60,178 @@ struct ExternalSstFileInfo;
 struct MemTableInfo;
 
 class DBImpl : public DB {
+ struct WalContext {
+   log::Writer *log;
+   WalContext *next;
+   std::shared_ptr<WriteBatch> batch;
+   WalContext(log::Writer *_log) : log(_log), next(nullptr) {
+     assert(log);
+   }
+ };
+
+ class WalWriter {
+  public:
+   WalWriter(DBImpl *db) :
+      db_(db), cv_(&mutex_), stopped_(false),
+      head_(nullptr), dumpping_logfile_(0) { assert(db); }
+
+   Status AddWalContext(WalContext *begin, WalContext *end) {
+     assert(begin != nullptr && end != nullptr);
+     {
+       InstrumentedMutexLock l(&status_mutex_);
+       if (!writer_status_.ok()) {
+         return writer_status_;
+       } else if (stopped_) {
+         return Status::ShutdownInProgress();
+       }
+     }
+     WalContext *ohead = head_.load(std::memory_order_acquire);
+     do {
+       end->next = ohead;
+     } while(!head_.compare_exchange_weak(
+                 ohead, begin, std::memory_order_relaxed));
+     return Status::OK();
+   }
+
+   Status WaitFinishWal(uint64_t log_number) {
+     InstrumentedMutexLock pl(&mutex_);
+     for (;;) {
+       {
+         InstrumentedMutexLock sl(&status_mutex_);
+         if (stopped_) {
+           return Status::ShutdownInProgress();
+         } else if (!writer_status_.ok()) {
+           return writer_status_;
+         }
+       }
+       uint64_t logfile = dumpping_logfile_.load(std::memory_order_acquire);
+       if (log_number < logfile  || (log_number == logfile &&
+           dumping_map_.empty() && pending_map_.empty() &&
+           head_.load(std::memory_order_acquire) == nullptr)) {
+         return Status::OK();
+       } else {
+         cv_.Wait();
+       }
+     }
+     return Status::OK();
+   }
+
+   std::shared_ptr<WriteBatch> GetBatch(SequenceNumber seq) {
+     InstrumentedMutexLock l(&mutex_);
+     InsertItemToMap(false);
+     using Iter = std::map<SequenceNumber, WalContext*>::iterator;
+     auto batch_checker = [seq] (Iter it) {
+       auto &batch = it->second->batch;
+       SequenceNumber batchSeq = WriteBatchInternal::Sequence(batch.get());
+       return batchSeq == seq? batch: nullptr;
+     };
+     auto it = lru_map_.lower_bound(seq);
+     if (it != lru_map_.end()) {
+       return batch_checker(it);
+     }
+     it = dumping_map_.lower_bound(seq);
+     if (it != dumping_map_.end()) {
+       return batch_checker(it);
+     }
+     it = pending_map_.lower_bound(seq);
+     if (it != dumping_map_.end()) {
+       return batch_checker(it);
+     }
+     return nullptr;
+   }
+
+   void Start() {
+     th_ = std::make_shared<std::thread>(WriterRoutine, this);
+#if defined(_GNU_SOURCE) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 12)
+     pthread_setname_np(th_->native_handle(), "WalWriter");
+#endif
+#endif
+   }
+
+   void StopWriter() {
+     {
+       InstrumentedMutexLock l(&status_mutex_);
+       stopped_ = true;
+       cv_.Signal();
+     }
+     if (th_) {
+       assert(th_->joinable());
+       th_->join();
+     }
+   }
+
+   ~WalWriter() {
+     auto map_deleter = [](std::map<SequenceNumber, WalContext*> &map) {
+       for (auto &it: map) {
+         delete it.second;
+       }
+     };
+     map_deleter(pending_map_);
+     map_deleter(dumping_map_);
+     map_deleter(lru_map_);
+     WalContext *ctx = head_.load(std::memory_order_relaxed);
+     while (ctx != nullptr) {
+       WalContext *next = ctx->next;
+       delete ctx;
+       ctx = next;
+     }
+   }
+
+   static void WriterRoutine(WalWriter *writer);
+
+  private:
+   void MarkError(const Status &s) {
+     {
+       InstrumentedMutexLock l(&db_->mutex_);
+       if (!db_->bg_error_.ok()) {
+         db_->bg_error_ = s;
+       }
+     }
+     {
+       InstrumentedMutexLock l(&status_mutex_);
+       writer_status_ = s;
+     }
+   }
+
+   void InsertItemToMap(bool for_dumpping_map) {
+     mutex_.AssertHeld();
+     auto &map = for_dumpping_map? dumping_map_: pending_map_;
+     WalContext *head = head_.exchange(nullptr, std::memory_order_relaxed);
+     while (head != nullptr) {
+       assert(head->batch);
+       SequenceNumber seq = WriteBatchInternal::Sequence(head->batch.get());
+       assert(pending_map_.count(seq) + dumping_map_.count(seq) +
+              lru_map_.count(seq) == 0);
+       map[seq] = head;
+       head = head->next;
+     }
+   }
+
+   void EvitItemIfNeed() {
+     mutex_.AssertHeld();
+     size_t num_item = lru_map_.size() + pending_map_.size();
+     auto it = lru_map_.begin();
+     while (num_item > 10000 && it != lru_map_.end()) {
+       delete it->second;
+       it = lru_map_.erase(it);
+     }
+   }
+
+   DBImpl *db_;
+   InstrumentedMutex mutex_;
+   InstrumentedCondVar cv_;
+   InstrumentedMutex status_mutex_;
+   Status writer_status_;
+   bool stopped_;
+   std::atomic<WalContext*> head_;
+   std::map<SequenceNumber, WalContext*> dumping_map_;
+   std::map<SequenceNumber, WalContext*> pending_map_;
+   std::map<SequenceNumber, WalContext*> lru_map_;
+   std::atomic<uint64_t> dumpping_logfile_;
+   std::shared_ptr<std::thread> th_;
+ };
+
  public:
   DBImpl(const DBOptions& options, const std::string& dbname);
   virtual ~DBImpl();
@@ -933,6 +1105,9 @@ class DBImpl : public DB {
     DBImpl* db;
     ManualCompaction* m;
   };
+
+  // the writer for dumping WAL asyncly
+  std::shared_ptr<WalWriter> wal_writer_;
 
   // Have we encountered a background error in paranoid mode?
   Status bg_error_;

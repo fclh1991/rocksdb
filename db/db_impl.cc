@@ -302,6 +302,60 @@ void DumpSupportInfo(Logger* logger) {
 
 }  // namespace
 
+void DBImpl::WalWriter::WriterRoutine(WalWriter *writer) {
+  assert(writer != nullptr);
+  Status s;
+  log::Writer *prevlog = nullptr;
+  writer->mutex_.Lock();
+  for (;;) {
+    writer->lru_map_.insert(writer->dumping_map_.begin(),
+                            writer->dumping_map_.end());
+    writer->dumping_map_.clear();
+    writer->EvitItemIfNeed();
+    if (!writer->pending_map_.empty()) {
+      std::swap(writer->pending_map_, writer->dumping_map_);
+    }
+    writer->InsertItemToMap(true);
+    if (writer->dumping_map_.empty()) {
+      {
+        InstrumentedMutexLock l(&writer->status_mutex_);
+        if (writer->stopped_) {
+          break;
+        }
+      }
+      writer->cv_.TimedWait(100);
+    } else {
+      writer->mutex_.Unlock();
+      bool switch_log = false;
+      for (auto &it: writer->dumping_map_) {
+        auto ctx = it.second;
+        assert(ctx != nullptr);
+        auto log = ctx->log;
+        assert(log != nullptr);
+        Slice log_entry = WriteBatchInternal::Contents(ctx->batch.get());
+        s = log->AddRecord(log_entry);
+        if (!s.ok()) {
+          writer->MarkError(s);
+          break;
+        }
+        if (prevlog != log) {
+          writer->dumpping_logfile_.store(log->get_log_number());
+          switch_log = prevlog != nullptr;
+        }
+        prevlog = log;
+      }
+      writer->mutex_.Lock();
+      if (!s.ok()) {
+        break;
+      } else if (switch_log) {
+        writer->cv_.SignalAll();
+      }
+    }
+  }
+  writer->cv_.SignalAll();
+  writer->mutex_.Unlock();
+}
+
 DBImpl::DBImpl(const DBOptions& options, const std::string& dbname)
     : env_(options.env),
       dbname_(dbname),
@@ -333,6 +387,7 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname)
       bg_flush_scheduled_(0),
       num_running_flushes_(0),
       bg_purge_scheduled_(0),
+      wal_writer_(db_options_.async_wal? new WalWriter(this): nullptr),
       disable_delete_obsolete_files_(0),
       delete_obsolete_files_next_run_(
           options.env->NowMicros() +
@@ -350,6 +405,12 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname)
       refitting_level_(false),
       opened_successfully_(false) {
   env_->GetAbsolutePath(dbname, &db_absolute_path_);
+
+  // Start the WAL writer if support async WAL
+  if (db_options_.async_wal) {
+    assert(wal_writer_);
+    wal_writer_->Start();
+  }
 
   // Reserve ten files or so for other uses and give the rest to TableCache.
   // Give a large number for setting of "infinite" open files.
@@ -459,6 +520,13 @@ DBImpl::~DBImpl() {
       PurgeObsoleteFiles(job_context);
     }
     job_context.Clean();
+    mutex_.Lock();
+  }
+
+  if (db_options_.async_wal) {
+    assert(wal_writer_);
+    mutex_.Unlock();
+    wal_writer_->StopWriter();
     mutex_.Lock();
   }
 
@@ -871,6 +939,12 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
     }
     while (!logs_.empty() && logs_.front().number < min_log_number) {
       auto& log = logs_.front();
+      if (db_options_.async_wal) {
+        assert(wal_writer_);
+        mutex_.Unlock();
+        wal_writer_->WaitFinishWal(log.number);
+        mutex_.Lock();
+      }
       if (log.getting_synced) {
         log_sync_cv_.Wait();
         // logs_ could have changed while we were waiting.
@@ -1818,10 +1892,19 @@ Status DBImpl::SyncClosedLogs(JobContext* job_context) {
     mutex_.Unlock();
 
     for (log::Writer* log : logs_to_sync) {
-      Log(InfoLogLevel::INFO_LEVEL, db_options_.info_log,
-          "[JOB %d] Syncing log #%" PRIu64, job_context->job_id,
-          log->get_log_number());
-      s = log->file()->Sync(db_options_.use_fsync);
+      if (!s.ok()) {
+        break;
+      }
+      if (db_options_.async_wal) {
+        assert(wal_writer_);
+        s = wal_writer_->WaitFinishWal(log->get_log_number());
+      }
+      if (s.ok()) {
+        Log(InfoLogLevel::INFO_LEVEL, db_options_.info_log,
+            "[JOB %d] Syncing log #%" PRIu64, job_context->job_id,
+            log->get_log_number());
+        s = log->file()->Sync(db_options_.use_fsync);
+      }
     }
     if (s.ok()) {
       s = directories_.GetWalDir()->Fsync();
@@ -2608,6 +2691,13 @@ Status DBImpl::SyncWAL() {
   RecordTick(stats_, WAL_FILE_SYNCED);
   Status status;
   for (log::Writer* log : logs_to_sync) {
+    if (db_options_.async_wal) {
+      assert(wal_writer_);
+      status = wal_writer_->WaitFinishWal(log->get_log_number());
+      if (!status.ok()) {
+        break;
+      }
+    }
     status = log->file()->SyncWithoutFlush(db_options_.use_fsync);
     if (!status.ok()) {
       break;
@@ -2640,6 +2730,9 @@ void DBImpl::MarkLogsSynced(
     assert(log.getting_synced);
     if (status.ok() && logs_.size() > 1) {
       logs_to_free_.push_back(log.ReleaseWriter());
+      if (db_options_.async_wal) {
+        assert(wal_writer_);
+      }
       it = logs_.erase(it);
     } else {
       log.getting_synced = false;
@@ -4451,6 +4544,10 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   w.callback = callback;
   w.log_ref = log_ref;
 
+  if (my_batch->CanBeStolen()) {
+    w.stealed_batch.reset(my_batch);
+  }
+
   if (!write_options.disableWAL) {
     RecordTick(stats_, WRITE_WITH_WAL);
   }
@@ -4469,7 +4566,11 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     if (w.ShouldWriteToMemtable()) {
       ColumnFamilyMemTablesImpl column_family_memtables(
           versions_->GetColumnFamilySet());
-      WriteBatchInternal::SetSequence(w.batch, w.sequence);
+      if (db_options_.async_wal) {
+        assert(WriteBatchInternal::Sequence(w.batch) == w.sequence);
+      } else {
+        WriteBatchInternal::SetSequence(w.batch, w.sequence);
+      }
       w.status = WriteBatchInternal::InsertInto(
           &w, &column_family_memtables, &flush_scheduler_,
           write_options.ignore_missing_column_families, 0 /*log_number*/, this,
@@ -4661,8 +4762,12 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
         }
 
         if (writer->ShouldWriteToWAL()) {
-          total_byte_size = WriteBatchInternal::AppendedByteSize(
-              total_byte_size, WriteBatchInternal::ByteSize(writer->batch));
+          if (db_options_.async_wal) {
+            total_byte_size += WriteBatchInternal::ByteSize(writer->batch);
+          } else {
+            total_byte_size = WriteBatchInternal::AppendedByteSize(
+                total_byte_size, WriteBatchInternal::ByteSize(writer->batch));
+          }
         }
       }
     }
@@ -4685,34 +4790,75 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       PERF_TIMER_GUARD(write_wal_time);
 
       WriteBatch* merged_batch = nullptr;
-      if (write_group.size() == 1 && write_group[0]->ShouldWriteToWAL()) {
-        merged_batch = write_group[0]->batch;
-        write_group[0]->log_used = logfile_number_;
-      } else {
-        // WAL needs all of the batches flattened into a single batch.
-        // We could avoid copying here with an iov-like AddRecord
-        // interface
-        merged_batch = &tmp_batch_;
+      if (db_options_.async_wal) {
+        WalContext *begin = nullptr, *end = nullptr;
+        assert(wal_writer_);
         for (auto writer : write_group) {
+          WalContext *ctx = new WalContext(logs_.back().writer);
           if (writer->ShouldWriteToWAL()) {
-            WriteBatchInternal::Append(merged_batch, writer->batch);
+            if (writer->stealed_batch) {
+              ctx->batch = writer->stealed_batch;
+            } else {
+              ctx->batch.reset(new WriteBatch(*writer->batch));
+            }
+            log_size += WriteBatchInternal::ByteSize(writer->batch);
+            if (begin == nullptr) {
+              begin = end = ctx;
+            } else {
+              assert(end != nullptr);
+              end->next = ctx;
+              end = ctx;
+            }
           }
           writer->log_used = logfile_number_;
         }
+        if (begin == nullptr) {
+          assert(end == nullptr);
+          WalContext *ctx = new WalContext(logs_.back().writer);
+          ctx->batch.reset(new WriteBatch());
+          begin = end = ctx;
+        }
+        uint64_t batch_seq = current_sequence;
+        WalContext *ctx = begin;
+        while (ctx != nullptr) {
+          WriteBatchInternal::SetSequence(ctx->batch.get(), batch_seq);
+          batch_seq += WriteBatchInternal::Count(ctx->batch.get());
+          ctx = ctx->next;
+        }
+        if (!log_size) {
+          assert(begin == end);
+          log_size = WriteBatchInternal::ByteSize(begin->batch.get());
+        }
+        status = wal_writer_->AddWalContext(begin, end);
+      } else {
+        if (write_group.size() == 1 && write_group[0]->ShouldWriteToWAL()) {
+          merged_batch = write_group[0]->batch;
+          write_group[0]->log_used = logfile_number_;
+        } else {
+          // WAL needs all of the batches flattened into a single batch.
+          // We could avoid copying here with an iov-like AddRecord
+          // interface
+          merged_batch = &tmp_batch_;
+          for (auto writer : write_group) {
+            if (writer->ShouldWriteToWAL()) {
+              WriteBatchInternal::Append(merged_batch, writer->batch);
+            }
+            writer->log_used = logfile_number_;
+          }
+        }
+        WriteBatchInternal::SetSequence(merged_batch, current_sequence);
+        Slice log_entry = WriteBatchInternal::Contents(merged_batch);
+        status = logs_.back().writer->AddRecord(log_entry);
+        log_size = log_entry.size();
       }
 
+      total_log_size_ += log_size;
+      alive_log_files_.back().AddSize(log_size);
       if (log_used != nullptr) {
         *log_used = logfile_number_;
       }
 
-      WriteBatchInternal::SetSequence(merged_batch, current_sequence);
-
-      Slice log_entry = WriteBatchInternal::Contents(merged_batch);
-      status = logs_.back().writer->AddRecord(log_entry);
-      total_log_size_ += log_entry.size();
-      alive_log_files_.back().AddSize(log_entry.size());
       log_empty_ = false;
-      log_size = log_entry.size();
       RecordTick(stats_, WAL_FILE_BYTES, log_size);
       if (status.ok() && need_log_sync) {
         RecordTick(stats_, WAL_FILE_SYNCED);
@@ -4725,9 +4871,15 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
         //  - as long as other threads don't modify it, it's safe to read
         //    from std::deque from multiple threads concurrently.
         for (auto& log : logs_) {
-          status = log.writer->file()->Sync(db_options_.use_fsync);
           if (!status.ok()) {
             break;
+          }
+          if (db_options_.async_wal) {
+            assert(wal_writer_);
+            status = wal_writer_->WaitFinishWal(log.number);
+          }
+          if (status.ok()) {
+            status = log.writer->file()->Sync(db_options_.use_fsync);
           }
         }
         if (status.ok() && need_log_dir_sync) {
@@ -5613,9 +5765,9 @@ Status DB::Put(const WriteOptions& opt, ColumnFamilyHandle* column_family,
   // Pre-allocate size of write batch conservatively.
   // 8 bytes are taken by header, 4 bytes for count, 1 byte for type,
   // and we allocate 11 extra bytes for key length, as well as value length.
-  WriteBatch batch(key.size() + value.size() + 24);
-  batch.Put(column_family, key, value);
-  return Write(opt, &batch);
+  WriteBatch *batch = new WriteBatch(key.size() + value.size() + 24, true);
+  batch->Put(column_family, key, value);
+  return Write(opt, batch);
 }
 
 Status DB::Delete(const WriteOptions& opt, ColumnFamilyHandle* column_family,

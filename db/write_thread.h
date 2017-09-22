@@ -78,6 +78,7 @@ class WriteThread {
   // Information kept for every waiting writer.
   struct Writer {
     WriteBatch* batch;
+    std::shared_ptr<WriteBatch> stealed_batch;
     bool sync;
     bool disableWAL;
     bool disable_memtable;
@@ -98,6 +99,7 @@ class WriteThread {
 
     Writer()
         : batch(nullptr),
+          stealed_batch(nullptr),
           sync(false),
           disableWAL(false),
           disable_memtable(false),
