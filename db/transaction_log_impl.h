@@ -18,6 +18,8 @@
 
 namespace rocksdb {
 
+class WalManager;
+
 class LogFileImpl : public LogFile {
  public:
   LogFileImpl(uint64_t logNum, WalFileType logType, SequenceNumber startSeq,
@@ -61,7 +63,8 @@ class TransactionLogIteratorImpl : public TransactionLogIterator {
       const std::string& dir, const DBOptions* options,
       const TransactionLogIterator::ReadOptions& read_options,
       const EnvOptions& soptions, const SequenceNumber seqNum,
-      std::unique_ptr<VectorLogPtr> files, VersionSet const* const versions);
+      std::unique_ptr<VectorLogPtr> files, VersionSet const* const versions,
+      WalManager *wal_manager);
 
   virtual bool Valid() override;
 
@@ -105,6 +108,7 @@ class TransactionLogIteratorImpl : public TransactionLogIterator {
   // Used only to get latest seq. num
   // TODO(icanadi) can this be just a callback?
   VersionSet const* const versions_;
+  WalManager *wal_manager_;
 
   // Reads from transaction log only if the writebatch record has been written
   bool RestrictedRead(Slice* record, std::string* scratch);

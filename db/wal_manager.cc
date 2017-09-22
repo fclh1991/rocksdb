@@ -38,6 +38,21 @@ namespace rocksdb {
 
 #ifndef ROCKSDB_LITE
 
+void WalManager::AddLogNumber(const uint64_t number) {
+  MutexLock l(&read_first_record_cache_mutex_);
+  log_numbers_.emplace(number);
+}
+
+uint64_t WalManager::GetNextLogNumber(const uint64_t number) {
+  MutexLock l(&read_first_record_cache_mutex_);
+  auto it = log_numbers_.find(number);
+  if (it != log_numbers_.end() && ++it != log_numbers_.end()) {
+    return *it;
+  } else {
+    return 0;
+  }
+}
+
 Status WalManager::GetSortedWalFiles(VectorLogPtr& files) {
   // First get sorted files in db dir, then get sorted files from archived
   // dir, to avoid a race condition where a log file is moved to archived
@@ -115,7 +130,7 @@ Status WalManager::GetUpdatesSince(
   }
   iter->reset(new TransactionLogIteratorImpl(
       db_options_.wal_dir, &db_options_, read_options, env_options_, seq,
-      std::move(wal_files), version_set));
+      std::move(wal_files), version_set, this));
   return (*iter)->status();
 }
 
@@ -189,6 +204,7 @@ void WalManager::PurgeObsoleteWALFiles() {
           } else {
             MutexLock l(&read_first_record_cache_mutex_);
             read_first_record_cache_.erase(number);
+            log_numbers_.erase(number);
           }
           continue;
         }
@@ -215,6 +231,7 @@ void WalManager::PurgeObsoleteWALFiles() {
             } else {
               MutexLock l(&read_first_record_cache_mutex_);
               read_first_record_cache_.erase(number);
+              log_numbers_.erase(number);
             }
           }
         }
@@ -259,6 +276,7 @@ void WalManager::PurgeObsoleteWALFiles() {
     } else {
       MutexLock l(&read_first_record_cache_mutex_);
       read_first_record_cache_.erase(log->LogNumber());
+      log_numbers_.erase(log->LogNumber());
     }
   }
 }

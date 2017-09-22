@@ -9,6 +9,7 @@
 #endif
 
 #include "db/transaction_log_impl.h"
+#include "db/wal_manager.h"
 #include <inttypes.h>
 #include "db/write_batch_internal.h"
 #include "util/file_reader_writer.h"
@@ -19,7 +20,8 @@ TransactionLogIteratorImpl::TransactionLogIteratorImpl(
     const std::string& dir, const DBOptions* options,
     const TransactionLogIterator::ReadOptions& read_options,
     const EnvOptions& soptions, const SequenceNumber seq,
-    std::unique_ptr<VectorLogPtr> files, VersionSet const* const versions)
+    std::unique_ptr<VectorLogPtr> files, VersionSet const* const versions,
+    WalManager *wal_manager)
     : dir_(dir),
       options_(options),
       read_options_(read_options),
@@ -31,7 +33,8 @@ TransactionLogIteratorImpl::TransactionLogIteratorImpl(
       currentFileIndex_(0),
       currentBatchSeq_(0),
       currentLastSeq_(0),
-      versions_(versions) {
+      versions_(versions),
+      wal_manager_(wal_manager) {
   assert(files_ != nullptr);
   assert(versions_ != nullptr);
 
@@ -194,6 +197,17 @@ void TransactionLogIteratorImpl::NextImpl(bool internal) {
         return;
       }
     } else {
+      auto log_number = wal_manager_->GetNextLogNumber(
+          files_->back()->LogNumber());
+      if (log_number != 0) {
+        files_->clear();
+        files_->emplace_back(new LogFileImpl(log_number, kAliveLogFile, 0, 0));
+        currentFileIndex_ = 0;
+        auto s = OpenLogReader(files_->at(currentFileIndex_).get());
+        if (s.ok()) {
+          continue;
+        }
+      }
       isValid_ = false;
       if (currentLastSeq_ == versions_->LastSequence()) {
         currentStatus_ = Status::OK();

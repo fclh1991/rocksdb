@@ -38,6 +38,9 @@ class WalManager {
         env_(db_options.env),
         purge_wal_files_last_run_(0) {}
 
+  void AddLogNumber(const uint64_t number);
+  uint64_t GetNextLogNumber(const uint64_t number);
+
   Status GetSortedWalFiles(VectorLogPtr& files);
 
   Status GetUpdatesSince(
@@ -81,6 +84,7 @@ class WalManager {
   // ------- WalManager state -------
   // cache for ReadFirstRecord() calls
   std::unordered_map<uint64_t, SequenceNumber> read_first_record_cache_;
+  std::set<uint64_t> log_numbers_;
   port::Mutex read_first_record_cache_mutex_;
 
   // last time when PurgeObsoleteWALFiles ran.

@@ -5010,6 +5010,9 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
   }
   if (creating_new_log) {
     logfile_number_ = new_log_number;
+#ifndef ROCKSDB_LITE
+    wal_manager_.AddLogNumber(new_log_number);
+#endif  // !ROCKSDB_LITE
     assert(new_log != nullptr);
     log_empty_ = true;
     log_dir_synced_ = false;
@@ -5727,6 +5730,9 @@ Status DB::Open(const DBOptions& db_options, const std::string& dbname,
     if (s.ok()) {
       lfile->SetPreallocationBlockSize((max_write_buffer_size / 10) + max_write_buffer_size);
       impl->logfile_number_ = new_log_number;
+#ifndef ROCKSDB_LITE
+      impl->wal_manager_.AddLogNumber(new_log_number);
+#endif  // !ROCKSDB_LITE
       unique_ptr<WritableFileWriter> file_writer(
           new WritableFileWriter(std::move(lfile), opt_env_options));
       impl->logs_.emplace_back(
