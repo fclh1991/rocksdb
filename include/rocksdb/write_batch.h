@@ -41,7 +41,7 @@ struct SliceParts;
 
 class WriteBatch : public WriteBatchBase {
  public:
-  explicit WriteBatch(size_t reserved_bytes = 0);
+  explicit WriteBatch(size_t reserved_bytes = 0, bool can_be_stolen = false);
   ~WriteBatch();
 
   using WriteBatchBase::Put;
@@ -269,6 +269,10 @@ class WriteBatch : public WriteBatchBase {
   // Returns trie if MarkRollback will be called during Iterate
   bool HasRollback() const;
 
+  bool CanBeStolen() const {
+    return can_be_stolen_;
+  }
+
   using WriteBatchBase::GetWriteBatch;
   WriteBatch* GetWriteBatch() override { return this; }
 
@@ -292,6 +296,7 @@ class WriteBatch : public WriteBatchBase {
 
  protected:
   std::string rep_;  // See comment in write_batch.cc for the format of rep_
+  bool can_be_stolen_ = false; // the batch can be stolen
 
   // Intentionally copyable
 };

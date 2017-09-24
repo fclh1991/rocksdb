@@ -129,8 +129,9 @@ struct SavePoints {
   std::stack<SavePoint> stack;
 };
 
-WriteBatch::WriteBatch(size_t reserved_bytes)
-    : save_points_(nullptr), content_flags_(0), rep_() {
+WriteBatch::WriteBatch(size_t reserved_bytes, bool can_be_stolen)
+    : save_points_(nullptr), content_flags_(0),
+      rep_(), can_be_stolen_(can_be_stolen) {
   rep_.reserve((reserved_bytes > WriteBatchInternal::kHeader) ?
     reserved_bytes : WriteBatchInternal::kHeader);
   rep_.resize(WriteBatchInternal::kHeader);
