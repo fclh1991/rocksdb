@@ -259,6 +259,13 @@ static Status ValidateOptions(
         "then os caching (allow_os_buffer) must also be enabled. ");
   }
 
+#ifdef ROCKSDB_LITE
+  if (db_options.async_wal) {
+    return Status::NotSupported(
+        "WAL is not allowed dumpping asyncly in LITE VERSION");
+  }
+#endif
+
   return Status::OK();
 }
 
@@ -332,6 +339,13 @@ void DBImpl::WalWriter::WriterRoutine(WalWriter *writer) {
         assert(ctx != nullptr);
         auto log = ctx->log;
         assert(log != nullptr);
+        if (!log->file()) {
+          s = writer->OpenWalWritableFileWriter(log);
+          if (!s.ok()) {
+            writer->MarkError(s);
+            break;
+          }
+        }
         Slice log_entry = WriteBatchInternal::Contents(ctx->batch.get());
         s = log->AddRecord(log_entry);
         if (!s.ok()) {
@@ -354,6 +368,38 @@ void DBImpl::WalWriter::WriterRoutine(WalWriter *writer) {
   }
   writer->cv_.SignalAll();
   writer->mutex_.Unlock();
+}
+
+Status DBImpl::WalWriter::OpenWalWritableFileWriter(log::Writer *logger) {
+  assert(logger && !logger->file());
+  EnvOptions opt_env_opt = db_->env_->OptimizeForLogWrite(db_->env_options_,
+                                                          db_->db_options_);
+  Status s;
+  uint64_t recycle_log_number = logger->get_recyle_log_number();
+  uint64_t new_log_number = logger->get_log_number();
+  std::unique_ptr<WritableFile> lfile;
+  if (recycle_log_number > 0) {
+    Log(InfoLogLevel::INFO_LEVEL, db_->db_options_.info_log,
+        "reusing log %" PRIu64 " from recycle list\n", recycle_log_number);
+    s = db_->env_->ReuseWritableFile(
+          LogFileName(db_->db_options_.wal_dir, new_log_number),
+          LogFileName(db_->db_options_.wal_dir, recycle_log_number),
+          &lfile, opt_env_opt);
+  } else {
+    s = NewWritableFile(db_->env_,
+                        LogFileName(db_->db_options_.wal_dir, new_log_number),
+                        &lfile, opt_env_opt);
+  }
+  if (!s.ok()) {
+    return s;
+  } else {
+    lfile->SetPreallocationBlockSize(1 << 20);
+    unique_ptr<WritableFileWriter> file_writer(
+                      new WritableFileWriter(std::move(lfile), opt_env_opt));
+    logger->SetWritableFileWriter(std::move(file_writer));
+    db_->wal_manager_.AddLogNumber(new_log_number);
+    return s;
+  }
 }
 
 DBImpl::DBImpl(const DBOptions& options, const std::string& dbname)
@@ -5110,28 +5156,38 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
     if (creating_new_log) {
       EnvOptions opt_env_opt =
           env_->OptimizeForLogWrite(env_options_, db_options_);
-      if (recycle_log_number) {
-        Log(InfoLogLevel::INFO_LEVEL, db_options_.info_log,
-            "reusing log %" PRIu64 " from recycle list\n", recycle_log_number);
-        s = env_->ReuseWritableFile(
-            LogFileName(db_options_.wal_dir, new_log_number),
-            LogFileName(db_options_.wal_dir, recycle_log_number), &lfile,
-            opt_env_opt);
-      } else {
-        s = NewWritableFile(env_,
-                            LogFileName(db_options_.wal_dir, new_log_number),
-                            &lfile, opt_env_opt);
+
+      if (!db_options_.async_wal) {
+        if (recycle_log_number) {
+          Log(InfoLogLevel::INFO_LEVEL, db_options_.info_log,
+              "reusing log %" PRIu64 " from recycle list\n", recycle_log_number);
+          s = env_->ReuseWritableFile(
+              LogFileName(db_options_.wal_dir, new_log_number),
+              LogFileName(db_options_.wal_dir, recycle_log_number), &lfile,
+              opt_env_opt);
+        } else {
+          s = NewWritableFile(env_,
+                              LogFileName(db_options_.wal_dir, new_log_number),
+                              &lfile, opt_env_opt);
+        }
+        if (s.ok()) {
+          // Our final size should be less than write_buffer_size
+          // (compression, etc) but err on the side of caution.
+          lfile->SetPreallocationBlockSize(
+              mutable_cf_options.write_buffer_size / 10 +
+              mutable_cf_options.write_buffer_size);
+        }
       }
       if (s.ok()) {
-        // Our final size should be less than write_buffer_size
-        // (compression, etc) but err on the side of caution.
-        lfile->SetPreallocationBlockSize(
-            mutable_cf_options.write_buffer_size / 10 +
-            mutable_cf_options.write_buffer_size);
-        unique_ptr<WritableFileWriter> file_writer(
-            new WritableFileWriter(std::move(lfile), opt_env_opt));
-        new_log = new log::Writer(std::move(file_writer), new_log_number,
-                                  db_options_.recycle_log_file_num > 0);
+          unique_ptr<WritableFileWriter> file_writer;
+          if (!db_options_.async_wal) {
+            assert(lfile);
+            file_writer.reset(new WritableFileWriter(std::move(lfile),
+                              opt_env_opt));
+          }
+          new_log = new log::Writer(std::move(file_writer), new_log_number,
+                                    db_options_.recycle_log_file_num > 0,
+                                    recycle_log_number);
       }
     }
 
@@ -5162,9 +5218,6 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
   }
   if (creating_new_log) {
     logfile_number_ = new_log_number;
-#ifndef ROCKSDB_LITE
-    wal_manager_.AddLogNumber(new_log_number);
-#endif  // !ROCKSDB_LITE
     assert(new_log != nullptr);
     log_empty_ = true;
     log_dir_synced_ = false;

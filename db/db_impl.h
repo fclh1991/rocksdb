@@ -182,6 +182,8 @@ class DBImpl : public DB {
    static void WriterRoutine(WalWriter *writer);
 
   private:
+   Status OpenWalWritableFileWriter(log::Writer *logger);
+
    void MarkError(const Status &s) {
      {
        InstrumentedMutexLock l(&db_->mutex_);
