@@ -19,11 +19,14 @@ namespace rocksdb {
 namespace log {
 
 Writer::Writer(unique_ptr<WritableFileWriter>&& dest,
-               uint64_t log_number, bool recycle_log_files)
+               uint64_t log_number, bool recycle_log_files,
+               uint64_t recyle_log_number)
     : dest_(std::move(dest)),
       block_offset_(0),
       log_number_(log_number),
-      recycle_log_files_(recycle_log_files) {
+      recycle_log_files_(recycle_log_files),
+      recyle_log_number_(recyle_log_number) {
+  assert(recyle_log_number > 0 || !recycle_log_files_);
   for (int i = 0; i <= kMaxRecordType; i++) {
     char t = static_cast<char>(i);
     type_crc_[i] = crc32c::Value(&t, 1);
@@ -33,7 +36,14 @@ Writer::Writer(unique_ptr<WritableFileWriter>&& dest,
 Writer::~Writer() {
 }
 
+
+void Writer::SetWritableFileWriter(std::unique_ptr<WritableFileWriter> &&dest) {
+  assert(!dest_ && block_offset_ == 0);
+  dest_ = std::move(dest);
+}
+
 Status Writer::AddRecord(const Slice& slice) {
+  assert(dest_);
   const char* ptr = slice.data();
   size_t left = slice.size();
 
@@ -88,6 +98,7 @@ Status Writer::AddRecord(const Slice& slice) {
 }
 
 Status Writer::EmitPhysicalRecord(RecordType t, const char* ptr, size_t n) {
+  assert(dest_);
   assert(n <= 0xffff);  // Must fit in two bytes
 
   size_t header_size;

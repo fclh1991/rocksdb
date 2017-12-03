@@ -73,7 +73,8 @@ class Writer {
   // "*dest" must be initially empty.
   // "*dest" must remain live while this Writer is in use.
   explicit Writer(unique_ptr<WritableFileWriter>&& dest,
-                  uint64_t log_number, bool recycle_log_files);
+                  uint64_t log_number, bool recycle_log_files,
+                  uint64_t recyle_log_number = 0);
   ~Writer();
 
   Status AddRecord(const Slice& slice);
@@ -83,11 +84,16 @@ class Writer {
 
   uint64_t get_log_number() const { return log_number_; }
 
+  uint64_t get_recyle_log_number() const { return recyle_log_number_; }
+
+  void SetWritableFileWriter(std::unique_ptr<WritableFileWriter> &&dest);
+
  private:
   unique_ptr<WritableFileWriter> dest_;
   size_t block_offset_;       // Current offset in block
   uint64_t log_number_;
   bool recycle_log_files_;
+  uint64_t recyle_log_number_;
 
   // crc32c values for all supported record types.  These are
   // pre-computed to reduce the overhead of computing the crc of the
