@@ -499,5 +499,30 @@ Status WalManager::ReadFirstLine(const std::string& fname,
   return status;
 }
 
+uint64_t WalManager::GetWALContainsBatch(SequenceNumber BatchSeq) {
+  std::vector<uint64_t> all_logs;
+  {
+    MutexLock l(&read_first_record_cache_mutex_);
+    for (auto it : log_numbers_) {
+      all_logs.push_back(it);
+    }
+  }
+  uint64_t target_log = 0;
+  for (auto it : all_logs) {
+    SequenceNumber starting_seq = 0;
+    ReadFirstRecord(kAliveLogFile, it, &starting_seq);
+    if (starting_seq == 0) {
+      ReadFirstRecord(kArchivedLogFile, it, &starting_seq);
+    }
+    if (starting_seq != 0) {
+      target_log = it;
+      if (starting_seq <= BatchSeq) {
+        break;
+      }
+    }
+  }
+  return target_log;
+}
+
 #endif  // ROCKSDB_LITE
 }  // namespace rocksdb

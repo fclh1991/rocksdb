@@ -64,6 +64,8 @@ class WalManager {
     return ReadFirstLine(fname, sequence);
   }
 
+  uint64_t GetWALContainsBatch(SequenceNumber BatchSeq);
+
  private:
   Status GetSortedWalsOfType(const std::string& path, VectorLogPtr& log_files,
                              WalFileType type);
