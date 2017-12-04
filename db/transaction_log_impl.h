@@ -11,7 +11,6 @@
 #include "rocksdb/options.h"
 #include "rocksdb/types.h"
 #include "rocksdb/transaction_log.h"
-#include "db/version_set.h"
 #include "db/log_reader.h"
 #include "db/filename.h"
 #include "port/port.h"
@@ -19,6 +18,7 @@
 namespace rocksdb {
 
 class WalManager;
+class DBImpl;
 
 class LogFileImpl : public LogFile {
  public:
@@ -63,7 +63,7 @@ class TransactionLogIteratorImpl : public TransactionLogIterator {
       const std::string& dir, const DBOptions* options,
       const TransactionLogIterator::ReadOptions& read_options,
       const EnvOptions& soptions, const SequenceNumber seqNum,
-      std::unique_ptr<VectorLogPtr> files, VersionSet const* const versions,
+      std::unique_ptr<VectorLogPtr> files, DBImpl const* const db,
       WalManager *wal_manager);
 
   virtual bool Valid() override;
@@ -107,7 +107,7 @@ class TransactionLogIteratorImpl : public TransactionLogIterator {
   SequenceNumber currentLastSeq_; // last sequence in the current batch
   // Used only to get latest seq. num
   // TODO(icanadi) can this be just a callback?
-  VersionSet const* const versions_;
+  DBImpl const* const db_;
   WalManager *wal_manager_;
 
   // Reads from transaction log only if the writebatch record has been written

@@ -113,7 +113,7 @@ Status WalManager::GetSortedWalFiles(VectorLogPtr& files) {
 Status WalManager::GetUpdatesSince(
     SequenceNumber seq, std::unique_ptr<TransactionLogIterator>* iter,
     const TransactionLogIterator::ReadOptions& read_options,
-    VersionSet* version_set) {
+    DBImpl *db) {
 
   //  Get all sorted Wal Files.
   //  Do binary search and open files and find the seq number.
@@ -130,7 +130,7 @@ Status WalManager::GetUpdatesSince(
   }
   iter->reset(new TransactionLogIteratorImpl(
       db_options_.wal_dir, &db_options_, read_options, env_options_, seq,
-      std::move(wal_files), version_set, this));
+      std::move(wal_files), db, this));
   return (*iter)->status();
 }
 

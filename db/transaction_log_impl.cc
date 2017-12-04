@@ -10,6 +10,7 @@
 
 #include "db/transaction_log_impl.h"
 #include "db/wal_manager.h"
+#include "db/db_impl.h"
 #include <inttypes.h>
 #include "db/write_batch_internal.h"
 #include "util/file_reader_writer.h"
@@ -20,7 +21,7 @@ TransactionLogIteratorImpl::TransactionLogIteratorImpl(
     const std::string& dir, const DBOptions* options,
     const TransactionLogIterator::ReadOptions& read_options,
     const EnvOptions& soptions, const SequenceNumber seq,
-    std::unique_ptr<VectorLogPtr> files, VersionSet const* const versions,
+    std::unique_ptr<VectorLogPtr> files, DBImpl const* const db,
     WalManager *wal_manager)
     : dir_(dir),
       options_(options),
@@ -33,10 +34,10 @@ TransactionLogIteratorImpl::TransactionLogIteratorImpl(
       currentFileIndex_(0),
       currentBatchSeq_(0),
       currentLastSeq_(0),
-      versions_(versions),
+      db_(db),
       wal_manager_(wal_manager) {
   assert(files_ != nullptr);
-  assert(versions_ != nullptr);
+  assert(db_ != nullptr);
 
   reporter_.env = options_->env;
   reporter_.info_log = options_->info_log.get();
@@ -87,7 +88,7 @@ bool TransactionLogIteratorImpl::RestrictedRead(
     Slice* record,
     std::string* scratch) {
   // Don't read if no more complete entries to read from logs
-  if (currentLastSeq_ >= versions_->LastSequence()) {
+  if (currentLastSeq_ >= db_->GetLatestSequenceNumber()) {
     return false;
   }
   return currentLogReader_->ReadRecord(record, scratch);
@@ -209,7 +210,7 @@ void TransactionLogIteratorImpl::NextImpl(bool internal) {
         }
       }
       isValid_ = false;
-      if (currentLastSeq_ == versions_->LastSequence()) {
+      if (currentLastSeq_ == db_->GetLatestSequenceNumber()) {
         currentStatus_ = Status::OK();
       } else {
         currentStatus_ = Status::Corruption("NO MORE DATA LEFT");
@@ -230,7 +231,7 @@ bool TransactionLogIteratorImpl::IsBatchExpected(
              "Discontinuity in log records. Got seq=%" PRIu64
              ", Expected seq=%" PRIu64 ", Last flushed seq=%" PRIu64
              ".Log iterator will reseek the correct batch.",
-             batchSeq, expectedSeq, versions_->LastSequence());
+             batchSeq, expectedSeq, db_->GetLatestSequenceNumber());
     reporter_.Info(buf);
     return false;
   }
@@ -262,7 +263,7 @@ void TransactionLogIteratorImpl::UpdateCurrentWriteBatch(const Slice& record) {
   currentLastSeq_ = currentBatchSeq_ +
                     WriteBatchInternal::Count(batch.get()) - 1;
   // currentBatchSeq_ can only change here
-  assert(currentLastSeq_ <= versions_->LastSequence());
+  assert(currentLastSeq_ <= db_->GetLatestSequenceNumber());
 
   currentBatch_ = std::move(batch);
   isValid_ = true;

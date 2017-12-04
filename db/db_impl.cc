@@ -5495,7 +5495,7 @@ Status DBImpl::GetUpdatesSince(
   if (seq > versions_->LastSequence()) {
     return Status::NotFound("Requested sequence not yet written in the db");
   }
-  return wal_manager_.GetUpdatesSince(seq, iter, read_options, versions_.get());
+  return wal_manager_.GetUpdatesSince(seq, iter, read_options, this);
 }
 
 Status DBImpl::DeleteFile(std::string name) {

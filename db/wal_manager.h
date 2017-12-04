@@ -29,6 +29,8 @@
 
 namespace rocksdb {
 
+class DBImpl;
+
 #ifndef ROCKSDB_LITE
 class WalManager {
  public:
@@ -46,7 +48,7 @@ class WalManager {
   Status GetUpdatesSince(
       SequenceNumber seq_number, std::unique_ptr<TransactionLogIterator>* iter,
       const TransactionLogIterator::ReadOptions& read_options,
-      VersionSet* version_set);
+      DBImpl *db);
 
   void PurgeObsoleteWALFiles();
 
