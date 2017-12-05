@@ -74,7 +74,8 @@ class DBImpl : public DB {
   public:
    WalWriter(DBImpl *db) :
       db_(db), cv_(&mutex_), stopped_(false),
-      head_(nullptr), dumpping_logfile_(0) { assert(db); }
+      head_(nullptr), dumpping_logfile_(0), batch_buffer_size_(0),
+      batch_buffer_limit_size_(db->db_options_.batch_buffer_size) { assert(db); }
 
    Status AddWalContext(WalContext *begin, WalContext *end) {
      assert(begin != nullptr && end != nullptr);
@@ -135,7 +136,7 @@ class DBImpl : public DB {
        return batch_checker(it);
      }
      it = pending_map_.lower_bound(seq);
-     if (it != dumping_map_.end()) {
+     if (it != pending_map_.end()) {
        return batch_checker(it);
      }
      return nullptr;
@@ -202,10 +203,12 @@ class DBImpl : public DB {
      auto &map = for_dumpping_map? dumping_map_: pending_map_;
      WalContext *head = head_.exchange(nullptr, std::memory_order_relaxed);
      while (head != nullptr) {
-       assert(head->batch);
-       SequenceNumber seq = WriteBatchInternal::Sequence(head->batch.get());
+       auto batch = head->batch.get();
+       assert(batch);
+       SequenceNumber seq = WriteBatchInternal::Sequence(batch);
        assert(pending_map_.count(seq) + dumping_map_.count(seq) +
               lru_map_.count(seq) == 0);
+       batch_buffer_size_ += WriteBatchInternal::ByteSize(batch);
        map[seq] = head;
        head = head->next;
      }
@@ -213,9 +216,12 @@ class DBImpl : public DB {
 
    void EvitItemIfNeed() {
      mutex_.AssertHeld();
-     size_t num_item = lru_map_.size() + pending_map_.size();
      auto it = lru_map_.begin();
-     while (num_item > 10000 && it != lru_map_.end()) {
+     while (batch_buffer_size_ > batch_buffer_limit_size_ &&
+            it != lru_map_.end()) {
+       auto batch = it->second->batch.get();
+       assert(batch);
+       batch_buffer_size_ -= WriteBatchInternal::ByteSize(batch);
        delete it->second;
        it = lru_map_.erase(it);
      }
@@ -233,6 +239,8 @@ class DBImpl : public DB {
    std::map<SequenceNumber, WalContext*> lru_map_;
    std::atomic<uint64_t> dumpping_logfile_;
    std::shared_ptr<std::thread> th_;
+   uint64_t batch_buffer_size_;
+   const uint64_t batch_buffer_limit_size_;
  };
 
  public:

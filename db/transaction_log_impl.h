@@ -110,8 +110,13 @@ class TransactionLogIteratorImpl : public TransactionLogIterator {
   DBImpl const* const db_;
   WalManager *wal_manager_;
 
+  bool async_wal_;
+
+  bool last_batch_from_buffer_;
+
   // Reads from transaction log only if the writebatch record has been written
-  bool RestrictedRead(Slice* record, std::string* scratch);
+  bool RestrictedRead(Slice* record, std::string* scratch,
+                      SequenceNumber expectedSeq);
   // Seeks to startingSequenceNumber reading from startFileIndex in files_.
   // If strict is set,then must get a batch starting with startingSequenceNumber
   void SeekToStartSequence(uint64_t startFileIndex = 0, bool strict = false);
@@ -119,12 +124,16 @@ class TransactionLogIteratorImpl : public TransactionLogIterator {
   // internal=true to let it find next entry even if it has to jump gaps because
   // the iterator may start off from the first available entry but promises to
   // be continuous after that
-  void NextImpl(bool internal = false);
+  void NextImpl(bool internal = false, SequenceNumber expectedSeq = 0);
   // Check if batch is expected, else return false
   bool IsBatchExpected(const WriteBatch* batch, SequenceNumber expectedSeq);
   // Update current batch if a continuous batch is found, else return false
   void UpdateCurrentWriteBatch(const Slice& record);
   Status OpenLogReader(const LogFile* file);
+
+  bool ReadTargetFromWAL(Slice *record, std::string *scratch,
+                         SequenceNumber expectedSeq);
+
 };
 }  //  namespace rocksdb
 #endif  // ROCKSDB_LITE

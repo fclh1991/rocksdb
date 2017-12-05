@@ -852,6 +852,12 @@ struct DBOptions {
   // Default: true
   bool paranoid_checks;
 
+  // If DB is opened with async_wal == true. The DB will reserve batch_buffer_size
+  // batch in memory. The TransactionLogIteratorImpl can get the writeBatch from
+  // Memory.
+  // Defaul: 0
+  uint64_t batch_buffer_size;
+
   // Use the specified object to interact with the environment,
   // e.g. to read/write files, schedule background work, etc.
   // Default: Env::Default()

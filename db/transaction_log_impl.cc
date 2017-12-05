@@ -35,10 +35,13 @@ TransactionLogIteratorImpl::TransactionLogIteratorImpl(
       currentBatchSeq_(0),
       currentLastSeq_(0),
       db_(db),
-      wal_manager_(wal_manager) {
+      wal_manager_(wal_manager),
+      async_wal_(false),
+      last_batch_from_buffer_(false) {
   assert(files_ != nullptr);
   assert(db_ != nullptr);
 
+  async_wal_ = db_->db_options_.async_wal;
   reporter_.env = options_->env;
   reporter_.info_log = options_->info_log.get();
   SeekToStartSequence(); // Seek till starting sequence
@@ -85,13 +88,28 @@ bool TransactionLogIteratorImpl::Valid() {
 }
 
 bool TransactionLogIteratorImpl::RestrictedRead(
-    Slice* record,
-    std::string* scratch) {
+    Slice* record, std::string* scratch, SequenceNumber expectedSeq) {
   // Don't read if no more complete entries to read from logs
-  if (currentLastSeq_ >= db_->GetLatestSequenceNumber()) {
+  if (expectedSeq >= db_->GetLatestSequenceNumber()) {
     return false;
   }
-  return currentLogReader_->ReadRecord(record, scratch);
+  if (async_wal_) {
+    assert(db_->wal_writer_);
+    auto batch = db_->wal_writer_->GetBatch(expectedSeq);
+    if (batch) {
+      assert(WriteBatchInternal::Sequence(batch.get()) == expectedSeq);
+      *scratch = batch->Data();
+      *record = Slice(*scratch);
+      last_batch_from_buffer_ = true;
+      return true;
+    }
+  }
+  if (last_batch_from_buffer_) {
+    return ReadTargetFromWAL(record, scratch, expectedSeq);
+  } else {
+    last_batch_from_buffer_ = false;
+    return currentLogReader_->ReadRecord(record, scratch);
+  }
 }
 
 void TransactionLogIteratorImpl::SeekToStartSequence(
@@ -101,16 +119,25 @@ void TransactionLogIteratorImpl::SeekToStartSequence(
   Slice record;
   started_ = false;
   isValid_ = false;
-  if (files_->size() <= startFileIndex) {
+  if (files_->size() <= startFileIndex && !async_wal_) {
     return;
   }
-  Status s = OpenLogReader(files_->at(startFileIndex).get());
-  if (!s.ok()) {
-    currentStatus_ = s;
-    reporter_.Info(currentStatus_.ToString().c_str());
+  if (startingSequenceNumber_ > db_->GetLatestSequenceNumber()) {
     return;
   }
-  while (RestrictedRead(&record, &scratch)) {
+  if (files_->size() > startFileIndex) {
+    Status s = OpenLogReader(files_->at(startFileIndex).get());
+    if (!s.ok()) {
+      currentStatus_ = s;
+      reporter_.Info(currentStatus_.ToString().c_str());
+      return;
+    }
+    last_batch_from_buffer_ = false;
+  } else {
+    assert(async_wal_);
+    last_batch_from_buffer_ = true;
+  }
+  while (RestrictedRead(&record, &scratch, startingSequenceNumber_)) {
     if (record.size() < WriteBatchInternal::kHeader) {
       reporter_.Corruption(
         record.size(), Status::Corruption("very small log record"));
@@ -143,21 +170,28 @@ void TransactionLogIteratorImpl::SeekToStartSequence(
     currentStatus_ = Status::Corruption("Gap in sequence number. Could not "
                                         "seek to required sequence number");
     reporter_.Info(currentStatus_.ToString().c_str());
-  } else if (files_->size() != 1) {
+  } else if (files_->size() > 1) {
     currentStatus_ = Status::Corruption("Start sequence was not found, "
                                         "skipping to the next available");
     reporter_.Info(currentStatus_.ToString().c_str());
     // Let NextImpl find the next available entry. started_ remains false
     // because we don't want to check for gaps while moving to start sequence
-    NextImpl(true);
+    NextImpl(true, startingSequenceNumber_);
   }
 }
 
 void TransactionLogIteratorImpl::Next() {
-  return NextImpl(false);
+  SequenceNumber expectedSeq = 0;
+  if (!started_) {
+    expectedSeq = startingSequenceNumber_;
+  } else {
+    expectedSeq = currentLastSeq_ + 1;
+  }
+  return NextImpl(false, expectedSeq);
 }
 
-void TransactionLogIteratorImpl::NextImpl(bool internal) {
+void TransactionLogIteratorImpl::NextImpl(bool internal,
+                                          SequenceNumber expectedSeq) {
   std::string scratch;
   Slice record;
   isValid_ = false;
@@ -166,11 +200,10 @@ void TransactionLogIteratorImpl::NextImpl(bool internal) {
     return SeekToStartSequence();
   }
   while(true) {
-    assert(currentLogReader_);
-    if (currentLogReader_->IsEOF()) {
+    if (currentLogReader_ && currentLogReader_->IsEOF()) {
       currentLogReader_->UnmarkEOF();
     }
-    while (RestrictedRead(&record, &scratch)) {
+    while (RestrictedRead(&record, &scratch, expectedSeq)) {
       if (record.size() < WriteBatchInternal::kHeader) {
         reporter_.Corruption(
           record.size(), Status::Corruption("very small log record"));
@@ -187,6 +220,8 @@ void TransactionLogIteratorImpl::NextImpl(bool internal) {
         return;
       }
     }
+
+    assert(!last_batch_from_buffer_);
 
     // Open the next file
     if (currentFileIndex_ < files_->size() - 1) {
@@ -282,5 +317,59 @@ Status TransactionLogIteratorImpl::OpenLogReader(const LogFile* logFile) {
       read_options_.verify_checksums_, 0, logFile->LogNumber()));
   return Status::OK();
 }
+
+bool TransactionLogIteratorImpl::ReadTargetFromWAL(
+    Slice *record, std::string *scratch, SequenceNumber expectedSeq) {
+  assert(async_wal_ && last_batch_from_buffer_);
+  uint64_t target_log = wal_manager_->GetWALContainsBatch(expectedSeq);
+  if (target_log == 0) {
+    return false;
+  }
+  uint64_t current_log = 0;
+  if (currentFileIndex_ < files_->size()) {
+    current_log = files_->at(currentFileIndex_)->LogNumber();
+  }
+  bool openWAL = true;
+  if (target_log != current_log) {
+    files_->clear();
+    files_->emplace_back(new LogFileImpl(target_log, kAliveLogFile, 0, 0));
+    currentFileIndex_ = 0;
+  } else if (currentLogReader_) {
+    openWAL = false;
+  }
+  last_batch_from_buffer_ = false;
+  if (openWAL) {
+    Status s = OpenLogReader(files_->at(currentFileIndex_).get());
+    if (!s.ok()) {
+      currentStatus_ = s;
+      reporter_.Info(currentStatus_.ToString().c_str());
+      return false;
+    }
+  }
+  assert(currentLogReader_);
+  if (currentLogReader_->IsEOF()) {
+    currentLogReader_->UnmarkEOF();
+  }
+  SequenceNumber batchSeq = 0;
+  do {
+    scratch->clear();
+    record->clear();
+    if (currentLogReader_->ReadRecord(record, scratch)) {
+      if (record->size() < WriteBatchInternal::kHeader) {
+        reporter_.Corruption(
+          record->size(), Status::Corruption("very small log record"));
+        continue;
+      } else {
+        std::unique_ptr<WriteBatch> batch(new WriteBatch());
+        WriteBatchInternal::SetContents(batch.get(), *record);
+        batchSeq = WriteBatchInternal::Sequence(batch.get());
+      }
+    } else {
+      return false;
+    }
+  } while (batchSeq < expectedSeq);
+  return true;
+}
+
 }  //  namespace rocksdb
 #endif  // ROCKSDB_LITE
